@@ -68,7 +68,8 @@ if uploaded_file and not st.session_state.pdf_indexed:
     indexing_status.info("📥 Indexing PDF into vector database...")
     vector_store = QdrantVectorStore.from_documents(
         documents=texts_split,
-        url="http://localhost:6333",  # Change if you're using Docker with different setup
+        url=st.secrets["QDRANT_URL"],
+        api_key=st.secrets["QDRANT_API_KEY"],
         collection_name="uploaded_pdf_vector",
         embedding=embeddings
     )
