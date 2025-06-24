@@ -53,7 +53,8 @@ if not st.session_state.web_indexed:
     try:
         indexing_status.info("📥 Checking if indexing exists...")
         vector_db = QdrantVectorStore.from_existing_collection(
-            url="http://vector-db:6333",
+            url=st.secrets["QDRANT_URL"],
+            api_key=st.secrets["QDRANT_API_KEY"],
             collection_name="web_vector",
             embedding=embeddings
         )
@@ -72,7 +73,8 @@ if not st.session_state.web_indexed:
 
         vector_db = QdrantVectorStore.from_documents(
             documents=texts_split,
-            url="http://vector-db:6333",
+            url=st.secrets["QDRANT_URL"],
+            api_key=st.secrets["QDRANT_API_KEY"],
             collection_name="web_vector",
             embedding=embeddings
         )
