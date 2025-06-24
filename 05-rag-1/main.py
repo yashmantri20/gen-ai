@@ -30,7 +30,7 @@ embeddings = OpenAIEmbeddings(model="text-embedding-3-large")
 # # Using [embeddings] create embeddings of [texts_split] and store in DB
 vector_store = QdrantVectorStore.from_documents(
     documents=texts_split,
-    url="http://localhost:6333",
+    url="http://vector-db:6333",
     collection_name="nodejs_vector",
     embedding=embeddings
 )
