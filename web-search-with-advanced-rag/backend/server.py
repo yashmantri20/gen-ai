@@ -5,14 +5,19 @@ from pydantic import BaseModel
 from fastapi.responses import JSONResponse
 from langgraph_pipeline import graph
 from sse_starlette.sse import EventSourceResponse
+from fastapi.responses import StreamingResponse
 import json
 from fastapi.middleware.cors import CORSMiddleware
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_openai import OpenAIEmbeddings
 from langchain_qdrant import QdrantVectorStore
 from langchain_community.document_loaders import RecursiveUrlLoader
-from collections import defaultdict
-import re
+import asyncio
+
+# TODO:
+# 1. Delete DB once done and on demand deletion
+# 2. Max depth
+# 3. unique DB thing
 
 # FastAPI app
 app = FastAPI()
@@ -32,64 +37,54 @@ class IndexRequest(BaseModel):
     base_url: str
     depth: int = 2
 
-@app.post("/index")
-async def index_website(request: IndexRequest):
-    try:
-         # Load docs
-        loader = RecursiveUrlLoader(request.base_url, max_depth=request.depth)
-        docs = loader.load()
+@app.get("/index-stream")
+async def index_stream(base_url: str, depth: int):
+    async def event_generator():
+        try:
+            yield f"event: info\ndata: Starting indexing for {base_url}\n\n"
 
-        # Optional: group by section
-        sections = []
-        for doc in docs:
-            title = doc.metadata.get("title", "")
-            sections.append(title)
+            # Step 1: Load documents
+            loader = RecursiveUrlLoader(base_url, max_depth=1)
+            docs = await asyncio.to_thread(loader.load)
+            yield f"event: step\ndata: Loaded {len(docs)} documents\n\n"
+            await asyncio.sleep(0.1)
 
-        # Split
-        text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=1000,
-            chunk_overlap=400
-        )
-        texts_split = text_splitter.split_documents(documents=docs)
+            # Step 2: Extract section titles
+            sections = [doc.metadata.get("title", "Untitled") for doc in docs]
+            yield f"event: step\ndata: Extracted {len(sections)} section titles\n\n"
+            await asyncio.sleep(0.1)
 
-        # Embed and index
-        embeddings = OpenAIEmbeddings(model="text-embedding-3-large")
-        vector_store = QdrantVectorStore.from_documents(
-            documents=texts_split,
-            url="http://vector-db:6333",
-            collection_name="web_vector",
-            embedding=embeddings
-        )
+            # Step 3: Split documents
+            text_splitter = RecursiveCharacterTextSplitter(
+                chunk_size=1000,
+                chunk_overlap=400
+            )
+            texts_split = text_splitter.split_documents(documents=docs)
+            yield f"event: step\ndata: Split into {len(texts_split)} text chunks\n\n"
+            await asyncio.sleep(0.1)
 
-        return JSONResponse(content={"message": "Indexing complete", "details": {
-            "total_documents": len(docs),
-            "sections_indexed": sections
-        }})
-    except Exception as e:
-        return JSONResponse(status_code=500, content={"error": str(e)})
+            # Step 4: Embed and store in vector DB
+            embeddings = OpenAIEmbeddings(model="text-embedding-3-large")
+            await asyncio.to_thread(
+                QdrantVectorStore.from_documents,
+                documents=texts_split,
+                url="http://vector-db:6333",
+                collection_name="web_vector1",
+                embedding=embeddings
+                )
+            yield f"event: step\ndata: Documents embedded and stored in Qdrant\n\n"
 
+            result = {
+                "total_documents": len(docs),
+                "sections_indexed": sections
+            }
+            yield f"event: done\ndata: {json.dumps(result)}\n\n"
 
-@app.post("/ask")
-async def ask_question(request: QueryRequest):
-    user_query = request.query
+        except Exception as e:
+            yield f"event: error\ndata: {str(e)}\n\n"
 
-    # Initial state
-    _state = {
-        "user_query": user_query,
-        "result": None,
-        "sub_queries": [],
-        "temp_result": []
-    }
-
-    # Run the graph
-    graph_result = graph.invoke(_state)
-
-    return JSONResponse(content={
-        "query": user_query,
-        "answer": graph_result["result"],
-        "sub_queries": graph_result["sub_queries"],
-    })
-
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
+    
 @app.get("/ask-stream")
 async def ask_question_stream(query: str):
     _state = {
@@ -103,12 +98,15 @@ async def ask_question_stream(query: str):
         async for step in graph.astream(_state):
             keys = list(step.keys())
             step_name = keys[0]
+            step_data = step[step_name]
+
+            _state.update(step_data)
+
             payload = {
                 "step": step_name
             }
             yield f"event: step\ndata: {json.dumps(payload)}\n\n"
 
-        # Signal done
         yield f"event: done\ndata: {json.dumps(_state)}\n\n"
 
-    return EventSourceResponse(event_generator())
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
