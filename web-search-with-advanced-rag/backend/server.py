@@ -2,9 +2,7 @@
 
 from fastapi import FastAPI
 from pydantic import BaseModel
-from fastapi.responses import JSONResponse
-from langgraph_pipeline import graph
-from sse_starlette.sse import EventSourceResponse
+from langgraph_pipeline import compile_graph_with_checkpointer
 from fastapi.responses import StreamingResponse
 import json
 from fastapi.middleware.cors import CORSMiddleware
@@ -13,14 +11,37 @@ from langchain_openai import OpenAIEmbeddings
 from langchain_qdrant import QdrantVectorStore
 from langchain_community.document_loaders import RecursiveUrlLoader
 import asyncio
+from qdrant_client import QdrantClient
+import uuid
+from contextlib import asynccontextmanager
+from langgraph.checkpoint.mongodb import AsyncMongoDBSaver
+from langchain_core.messages import messages_to_dict
 
 # TODO:
-# 1. Delete DB once done and on demand deletion
-# 2. Max depth
-# 3. unique DB thing
+# 1. Max depth
 
 # FastAPI app
-app = FastAPI()
+DB_URI = "mongodb://admin:admin@mongodb:27017"
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    saver_cm = AsyncMongoDBSaver.from_conn_string(DB_URI)
+    saver = await saver_cm.__aenter__()
+
+    graph = compile_graph_with_checkpointer(checkpointer=saver)
+
+    app.state.mongo_saver_cm = saver_cm
+    app.state.mongo_saver = saver
+    app.state.graph_with_mongo = graph
+
+    print("✅ Lifespan startup completed")
+    try:
+        yield
+    finally:
+        await saver_cm.__aexit__(None, None, None)
+        print("✅ MongoDB saver closed")
+
+app = FastAPI(lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -64,17 +85,19 @@ async def index_stream(base_url: str, depth: int):
             await asyncio.sleep(0.1)
 
             # Step 4: Embed and store in vector DB
+            collection_name = f"web_vector_{uuid.uuid4().hex}"
             embeddings = OpenAIEmbeddings(model="text-embedding-3-large")
             await asyncio.to_thread(
                 QdrantVectorStore.from_documents,
                 documents=texts_split,
                 url="http://vector-db:6333",
-                collection_name="web_vector1",
+                collection_name=collection_name,
                 embedding=embeddings
                 )
             yield f"event: step\ndata: Documents embedded and stored in Qdrant\n\n"
 
             result = {
+                "collection_name": collection_name,
                 "total_documents": len(docs),
                 "sections_indexed": sections
             }
@@ -86,21 +109,28 @@ async def index_stream(base_url: str, depth: int):
     return StreamingResponse(event_generator(), media_type="text/event-stream")
     
 @app.get("/ask-stream")
-async def ask_question_stream(query: str):
+async def ask_question_stream(query: str, collection_name: str):
     _state = {
+        "collection_name": collection_name,
         "user_query": query,
         "result": None,
         "sub_queries": [],
-        "temp_result": []
+        "temp_result": [],
+        "messages": [{"role":"user", "content": query}]
     }
 
     async def event_generator():
-        async for step in graph.astream(_state):
+        config = {"configurable": {"thread_id": "47"}}
+        async for step in app.state.graph_with_mongo.astream(_state, config):
             keys = list(step.keys())
             step_name = keys[0]
             step_data = step[step_name]
 
-            _state.update(step_data)
+            serializable_state = {
+                **step_data,
+                "messages": messages_to_dict(step_data["messages"])
+            }
+            _state.update(serializable_state)
 
             payload = {
                 "step": step_name
@@ -110,3 +140,9 @@ async def ask_question_stream(query: str):
         yield f"event: done\ndata: {json.dumps(_state)}\n\n"
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+@app.delete("/delete-collection")
+async def delete_collection(name: str):
+    client = QdrantClient(url="http://vector-db:6333")
+    client.delete_collection(collection_name=name)
+    return {"status": "deleted"}

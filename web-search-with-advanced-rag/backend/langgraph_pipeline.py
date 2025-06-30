@@ -7,6 +7,11 @@ from typing_extensions import TypedDict
 from langgraph.graph import StateGraph, START, END
 import re
 from qdrant_client.http.exceptions import UnexpectedResponse
+from langgraph.graph.message import add_messages
+from typing import Annotated
+from typing import Annotated
+from langgraph.graph.message import add_messages
+from langchain.chat_models import init_chat_model
 
 # nodes
 # state, graph, invoke and compile
@@ -16,19 +21,20 @@ from qdrant_client.http.exceptions import UnexpectedResponse
 
 load_dotenv()
 
-model = 'gpt-4.1-nano'
-
 class State(TypedDict):
+    collection_name: str
     user_query: str
     sub_queries: list
     result: str
     temp_result: list
+    messages: Annotated[list, add_messages]
 
 client = OpenAI()
 
 embeddings = OpenAIEmbeddings(
     model="text-embedding-3-large"
 )
+llm = init_chat_model(model_provider="openai", model="gpt-4.1-nano")
 
 def generate_sub_queries(state: State):
     """
@@ -68,16 +74,13 @@ Sub-Queries:
 
     query = state['user_query']
 
-    completion = client.chat.completions.create(
-        model=model,
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": query},
-        ],
-        temperature=0.2,
-    )
+    response = llm.invoke([
+        *state["messages"][-10:],
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": query}
+    ])
 
-    content = completion.choices[0].message.content.strip()
+    content = response.content.strip()
 
     # Parse into list
     state['sub_queries'] = [query]
@@ -86,8 +89,8 @@ Sub-Queries:
             parts = line.strip().split(".", 1)
             if len(parts) == 2:
                 state['sub_queries'].append(parts[1].strip())
+    print(state['sub_queries'])
     return state
-
 
 def generate_answers(state: State):
     state['temp_result'] = []
@@ -96,7 +99,7 @@ def generate_answers(state: State):
     try:
         vector_db = QdrantVectorStore.from_existing_collection(
             url="http://vector-db:6333",
-            collection_name="web_vector1",
+            collection_name=state['collection_name'],
             embedding=embeddings
         )
     except UnexpectedResponse:
@@ -111,8 +114,6 @@ def generate_answers(state: State):
         f"Page Content: {result.page_content}\n\nPage Description: {result.metadata['description']}\n\nUrl: {result.metadata['source']}"
         for result in search_results
         ])
-
-        print(context)
 
         SYSTEM_PROMPT = f"""
         You are a helpful AI assistant designed to answer user questions **strictly based on the context provided below**, which has been retrieved from webpages using recursive web loading.
@@ -146,15 +147,14 @@ def generate_answers(state: State):
         {context}
         """
 
-        chat_completion = client.chat.completions.create(
-            model=model,
-            messages=[
-                { "role": "system", "content": SYSTEM_PROMPT },
-                { "role": "user", "content": enhanced_query },
-            ]
-        )
+        response = llm.invoke([
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": enhanced_query}
+        ])
 
-        state['temp_result'].append(chat_completion.choices[0].message.content)
+        content = response.content.strip()
+
+        state['temp_result'].append(content)
     return state
 
 def select_best_answer(state: State):
@@ -177,13 +177,13 @@ def select_best_answer(state: State):
         **Rules:**
         - Do NOT use any outside knowledge.
         - Select based strictly on the provided answers.
-        - **ONLY** return the number of the best answer
+        - **ONLY return the text of the best answer exactly as it is given**.
+        - Do NOT add or remove explanation or formatting and remove Ans n text.
     """
 
     temp_result = ''
     for i, text in enumerate(state['temp_result'], 1):
         temp_result += f"\n\nAns {i}. {text}"
-
     print(temp_result)
     user_query = state['user_query']
     
@@ -195,22 +195,17 @@ def select_best_answer(state: State):
         },
     ]
 
-    completion = client.chat.completions.create(
-        model=model,
-        messages=messages,
-        temperature=0.0
-    )
+    response = llm.invoke(messages)
 
-    response_text = completion.choices[0].message.content.strip()
-    print(response_text)
-    match = re.search(r"\b(\d+)\b", response_text)
-    if match:
-        selected_idx = int(match.group(1))
-        state["result"] = state["temp_result"][selected_idx - 1]
-    else:
-        state["result"] = "I'm sorry, I could not interpret the selection."
-    print(state['result'])
-    return state
+    content = response.content.strip()
+
+    # match = re.search(r"\b(\d+)\b", content)
+    # if match:
+    #     selected_idx = int(match.group(1))
+    #     state["result"] = state["temp_result"][selected_idx - 1]
+    # else:
+    #     state["result"] = "I'm sorry, I could not interpret the selection."
+    return {"messages": [response], "result": content}
 
 graph_builder = StateGraph(State)
 
@@ -223,4 +218,6 @@ graph_builder.add_edge("generate_sub_queries", "generate_answers")
 graph_builder.add_edge("generate_answers", "select_best_answer")
 graph_builder.add_edge("select_best_answer", END)
 
-graph = graph_builder.compile()
+def compile_graph_with_checkpointer(checkpointer):
+    graph_with_checkpointer = graph_builder.compile(checkpointer=checkpointer)
+    return graph_with_checkpointer
