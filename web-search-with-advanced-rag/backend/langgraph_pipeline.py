@@ -1,17 +1,17 @@
 
 from langchain_openai import OpenAIEmbeddings
 from langchain_qdrant import QdrantVectorStore
-from openai import OpenAI
 from dotenv import load_dotenv
 from typing_extensions import TypedDict
 from langgraph.graph import StateGraph, START, END
-import re
 from qdrant_client.http.exceptions import UnexpectedResponse
 from langgraph.graph.message import add_messages
 from typing import Annotated
 from typing import Annotated
 from langgraph.graph.message import add_messages
 from langchain.chat_models import init_chat_model
+from persona import HITESH_REWRITER_SYSTEM_PROMPT
+import os
 
 # nodes
 # state, graph, invoke and compile
@@ -28,8 +28,6 @@ class State(TypedDict):
     result: str
     temp_result: list
     messages: Annotated[list, add_messages]
-
-client = OpenAI()
 
 embeddings = OpenAIEmbeddings(
     model="text-embedding-3-large"
@@ -98,7 +96,8 @@ def generate_answers(state: State):
     # Initialize the vector DB only when needed
     try:
         vector_db = QdrantVectorStore.from_existing_collection(
-            url="http://vector-db:6333",
+            url=os.getenv("QDRANT_URL"),
+            api_key=os.getenv("QDRANT_API_KEY"),
             collection_name=state['collection_name'],
             embedding=embeddings
         )
@@ -178,7 +177,9 @@ def select_best_answer(state: State):
         - Do NOT use any outside knowledge.
         - Select based strictly on the provided answers.
         - **ONLY return the text of the best answer exactly as it is given**.
-        - Do NOT add or remove explanation or formatting and remove Ans n text.
+        - Do NOT add, remove explanation or formatting 
+        - Just remove the Ans n. text and give everything as it is.
+        - Include source link everytime
     """
 
     temp_result = ''
@@ -199,24 +200,35 @@ def select_best_answer(state: State):
 
     content = response.content.strip()
 
-    # match = re.search(r"\b(\d+)\b", content)
-    # if match:
-    #     selected_idx = int(match.group(1))
-    #     state["result"] = state["temp_result"][selected_idx - 1]
-    # else:
-    #     state["result"] = "I'm sorry, I could not interpret the selection."
     return {"messages": [response], "result": content}
+
+def answer_like_hitesh_sir(state: State):
+    SYSTEM_PROMPT = HITESH_REWRITER_SYSTEM_PROMPT
+
+    factual_answer = state["result"]
+
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": f"Factual Answer:\n{factual_answer}"},
+    ]
+
+    response = llm.invoke(messages)
+    state["result"] = response.content.strip()
+
+    return state
 
 graph_builder = StateGraph(State)
 
 graph_builder.add_node("generate_sub_queries", generate_sub_queries)
 graph_builder.add_node("generate_answers", generate_answers)
 graph_builder.add_node("select_best_answer", select_best_answer)
+graph_builder.add_node("answer_like_hitesh_sir", answer_like_hitesh_sir)
 
 graph_builder.add_edge(START, "generate_sub_queries")
 graph_builder.add_edge("generate_sub_queries", "generate_answers")
 graph_builder.add_edge("generate_answers", "select_best_answer")
-graph_builder.add_edge("select_best_answer", END)
+graph_builder.add_edge("select_best_answer", "answer_like_hitesh_sir")
+graph_builder.add_edge("answer_like_hitesh_sir", END)
 
 def compile_graph_with_checkpointer(checkpointer):
     graph_with_checkpointer = graph_builder.compile(checkpointer=checkpointer)

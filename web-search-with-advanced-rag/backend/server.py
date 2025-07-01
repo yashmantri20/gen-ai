@@ -16,9 +16,8 @@ import uuid
 from contextlib import asynccontextmanager
 from langgraph.checkpoint.mongodb import AsyncMongoDBSaver
 from langchain_core.messages import messages_to_dict
-
-# TODO:
-# 1. Max depth
+from fastapi import Query
+import os
 
 # FastAPI app
 DB_URI = "mongodb://admin:admin@mongodb:27017"
@@ -56,29 +55,35 @@ class QueryRequest(BaseModel):
 
 class IndexRequest(BaseModel):
     base_url: str
-    depth: int = 2
+    depth: int
 
 @app.get("/index-stream")
-async def index_stream(base_url: str, depth: int):
+async def index_stream(
+    base_url: str, depth: int = Query(2, description="Max crawl depth")
+):
     async def event_generator():
         try:
             yield f"event: info\ndata: Starting indexing for {base_url}\n\n"
-
             # Step 1: Load documents
-            loader = RecursiveUrlLoader(base_url, max_depth=1)
+            loader = RecursiveUrlLoader(base_url, max_depth=depth)
             docs = await asyncio.to_thread(loader.load)
             yield f"event: step\ndata: Loaded {len(docs)} documents\n\n"
             await asyncio.sleep(0.1)
 
             # Step 2: Extract section titles
-            sections = [doc.metadata.get("title", "Untitled") for doc in docs]
+            sections = [
+                {
+                    "title": doc.metadata.get("title", "Untitled"),
+                    "source": doc.metadata.get("source", "Unknown"),
+                }
+                for doc in docs
+            ]
             yield f"event: step\ndata: Extracted {len(sections)} section titles\n\n"
             await asyncio.sleep(0.1)
 
             # Step 3: Split documents
             text_splitter = RecursiveCharacterTextSplitter(
-                chunk_size=1000,
-                chunk_overlap=400
+                chunk_size=1000, chunk_overlap=400
             )
             texts_split = text_splitter.split_documents(documents=docs)
             yield f"event: step\ndata: Split into {len(texts_split)} text chunks\n\n"
@@ -87,19 +92,25 @@ async def index_stream(base_url: str, depth: int):
             # Step 4: Embed and store in vector DB
             collection_name = f"web_vector_{uuid.uuid4().hex}"
             embeddings = OpenAIEmbeddings(model="text-embedding-3-large")
-            await asyncio.to_thread(
-                QdrantVectorStore.from_documents,
-                documents=texts_split,
-                url="http://vector-db:6333",
-                collection_name=collection_name,
-                embedding=embeddings
+            batch_size = 40
+            # Process batches sequentially
+            for i in range(0, len(texts_split), batch_size):
+                batch = texts_split[i : i + batch_size]
+                await asyncio.to_thread(
+                    QdrantVectorStore.from_documents,
+                    documents=batch,
+                    url=os.getenv("QDRANT_URL"),
+                    api_key=os.getenv("QDRANT_API_KEY"),
+                    collection_name=collection_name,
+                    embedding=embeddings,
+                    timeout=120.0
                 )
             yield f"event: step\ndata: Documents embedded and stored in Qdrant\n\n"
 
             result = {
                 "collection_name": collection_name,
                 "total_documents": len(docs),
-                "sections_indexed": sections
+                "sections_indexed": sections,
             }
             yield f"event: done\ndata: {json.dumps(result)}\n\n"
 
@@ -107,7 +118,7 @@ async def index_stream(base_url: str, depth: int):
             yield f"event: error\ndata: {str(e)}\n\n"
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
-    
+
 @app.get("/ask-stream")
 async def ask_question_stream(query: str, collection_name: str):
     _state = {
@@ -116,11 +127,11 @@ async def ask_question_stream(query: str, collection_name: str):
         "result": None,
         "sub_queries": [],
         "temp_result": [],
-        "messages": [{"role":"user", "content": query}]
+        "messages": [{"role": "user", "content": query}],
     }
 
     async def event_generator():
-        config = {"configurable": {"thread_id": "47"}}
+        config = {"configurable": {"thread_id": collection_name}}
         async for step in app.state.graph_with_mongo.astream(_state, config):
             keys = list(step.keys())
             step_name = keys[0]
@@ -128,21 +139,22 @@ async def ask_question_stream(query: str, collection_name: str):
 
             serializable_state = {
                 **step_data,
-                "messages": messages_to_dict(step_data["messages"])
+                "messages": messages_to_dict(step_data["messages"]),
             }
             _state.update(serializable_state)
 
-            payload = {
-                "step": step_name
-            }
+            payload = {"step": step_name}
             yield f"event: step\ndata: {json.dumps(payload)}\n\n"
 
         yield f"event: done\ndata: {json.dumps(_state)}\n\n"
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
+
 @app.delete("/delete-collection")
 async def delete_collection(name: str):
-    client = QdrantClient(url="http://vector-db:6333")
+    client = QdrantClient(
+        url=os.getenv("QDRANT_URL"), api_key=os.getenv("QDRANT_API_KEY")
+    )
     client.delete_collection(collection_name=name)
     return {"status": "deleted"}
