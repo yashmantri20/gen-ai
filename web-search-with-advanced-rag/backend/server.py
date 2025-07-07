@@ -1,6 +1,6 @@
 # api_server.py
 
-from fastapi import FastAPI
+from fastapi import FastAPI, UploadFile, File
 from pydantic import BaseModel
 from langgraph_pipeline import compile_graph_with_checkpointer
 from fastapi.responses import StreamingResponse
@@ -18,6 +18,10 @@ from langgraph.checkpoint.mongodb import AsyncMongoDBSaver
 from langchain_core.messages import messages_to_dict
 from fastapi import Query
 import os
+from fastapi.responses import JSONResponse
+import speech_recognition as sr
+import io
+import subprocess
 
 # FastAPI app
 DB_URI = "mongodb://admin:admin@mongodb:27017"
@@ -49,6 +53,21 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+import io
+import subprocess
+
+def convert_to_wav(audio_data: bytes) -> io.BytesIO:
+    process = subprocess.Popen(
+        ["ffmpeg", "-i", "pipe:0", "-f", "wav", "-"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE
+    )
+    out, err = process.communicate(input=audio_data)
+    if process.returncode != 0:
+        raise RuntimeError(f"ffmpeg conversion failed: {err.decode()}")
+    return io.BytesIO(out)
 
 class QueryRequest(BaseModel):
     query: str
@@ -158,3 +177,23 @@ async def delete_collection(name: str):
     )
     client.delete_collection(collection_name=name)
     return {"status": "deleted"}
+
+@app.post("/upload-audio")
+async def upload_audio(file: UploadFile = File(...)):
+    recognizer = sr.Recognizer()
+    audio_data = await file.read()
+    wav_data = convert_to_wav(audio_data)
+
+    with sr.AudioFile(wav_data) as source:
+        audio = recognizer.record(source)
+
+    # Convert speech to text
+    try:
+        stt = recognizer.recognize_google(audio)
+    except sr.UnknownValueError:
+        return {"error": "Could not understand audio."}
+    except sr.RequestError as e:
+        return {"error": f"Google STT error: {e}"}
+
+    print("You said:", stt)
+    return JSONResponse({"message": stt})
